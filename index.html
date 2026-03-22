@@ -467,8 +467,10 @@ function setFieldType(type) {
 
 function updateFieldTypeBtns() {
   const type = currentFieldType;
-  document.getElementById('ft-it').className = 'field-type-btn' + (type==='it'?' active-it':'');
-  document.getElementById('ft-mech').className = 'field-type-btn' + (type==='mech'?' active-mech':'');
+  const ftIt = document.getElementById('ft-it');
+  const ftMech = document.getElementById('ft-mech');
+  if(ftIt) ftIt.className = 'field-type-btn' + (type==='it'?' active-it':'');
+  if(ftMech) ftMech.className = 'field-type-btn' + (type==='mech'?' active-mech':'');
 }
 
 // ── RENDER ─────────────────────────────────────────────────────────────────────
@@ -629,6 +631,7 @@ function getDegree(){
 function toggleSettings(){
   const panel=document.getElementById("settings-panel");
   const btn=document.getElementById("settings-btn");
+  if(!panel) return;
   const isOpen=panel.style.display!=="none";
   if(!isOpen){
     document.getElementById("roles-input").value=getSearchRoles();
@@ -703,20 +706,19 @@ async function fetchLiveJobs(){
   btn.disabled=true;
   btn.innerHTML='<span class="spinner"></span> Fetching...';
   statusEl.className="ai-status fetching";
+  msgEl.textContent="Searching for fresh jobs across German portals...";
 
   const roles=getSearchRoles().split("\n").filter(r=>r.trim()).map(r=>r.trim());
   const location=getSearchLocation();
   const fieldLabel=currentFieldType==='it'?'IT and software':'Mechanical Engineering';
   const portalList=currentFieldType==='it'
-    ?'stepstone.de, kimeta.de, meinpraktikum.de, monster.de, absolventa.de, jobware.de, arbeitsagentur.de, praktikum.info, berufsstart.de'
-    :'stepstone.de, kimeta.de, meinpraktikum.de, monster.de, absolventa.de, jobware.de, arbeitsagentur.de';
-
-  msgEl.textContent="Searching "+fieldLabel+" jobs across German portals...";
+    ?'stepstone.de, kimeta.de, meinpraktikum.de, monster.de, absolventa.de, jobware.de, arbeitsagentur.de'
+    :'stepstone.de, kimeta.de, meinpraktikum.de, monster.de, absolventa.de';
 
   const prompt=`List 8 real ${fieldLabel} internship Pflichtpraktikum jobs in ${location} from portals: ${portalList}.
 Search roles: ${roles.join(', ')}.
 
-Use EXACTLY this format for each job, no extra text:
+Use EXACTLY this format, no extra text before or after:
 
 JOB_START
 COMPANY: name
@@ -732,133 +734,69 @@ DAYS: 2
 SOURCE: Stepstone
 JOB_END`;
 
-  // Try multiple approaches in order
-  const approaches = [
-    tryDirectAPI,
-    tryProxiedAPI,
-  ];
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 3000,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
 
-  let success = false;
-  for(const approach of approaches){
-    try{
-      const jobs = await approach(prompt);
-      if(jobs && jobs.length > 0){
-        let added=0;
-        jobs.forEach(job=>{
-          if(!JOBS.some(j=>j.title===job.title&&j.company===job.company)){
-            JOBS.unshift({...job,id:nextId++,fieldType:currentFieldType,isNew:true});
-            added++;
-          }
-        });
-        setTimeout(()=>{JOBS.forEach(j=>j.isNew=false);applyFilters();},10000);
-        statusEl.className="ai-status success";
-        msgEl.textContent="Found "+jobs.length+" jobs from "+portalList.split(',').length+" portals · "+added+" new added";
-        timeEl.textContent=new Date().toLocaleTimeString();
-        showToast(added>0?added+" new jobs added!":"Jobs refreshed!");
-        applyFilters();
-        success=true;
-        break;
-      }
-    }catch(e){
-      console.warn("Approach failed:",e.message);
+    if(!res.ok) {
+      const errText = await res.text();
+      throw new Error("API error " + res.status + ": " + errText.slice(0,100));
     }
-  }
 
-  if(!success){
-    // All API approaches failed — show the paste panel
+    const data = await res.json();
+    if(data.error) throw new Error(data.error.message || "API returned error");
+
+    const text = (data.content||[]).map(b=>b.type==="text"?b.text:"").join("");
+    if(!text) throw new Error("Empty response from API");
+
+    const jobs = parseJobBlocks(text);
+
+    if(!jobs.length) {
+      // No new jobs found — show a clean message, no error
+      statusEl.className="ai-status success";
+      msgEl.textContent="Search complete — no new jobs found today. Check back tomorrow!";
+      timeEl.textContent=new Date().toLocaleTimeString();
+      showToast("No new jobs found");
+      btn.disabled=false;
+      btn.innerHTML="⟳ Fetch New Jobs";
+      return;
+    }
+
+    let added=0;
+    jobs.forEach(job=>{
+      if(!JOBS.some(j=>j.title===job.title&&j.company===job.company)){
+        JOBS.unshift({...job,id:nextId++,fieldType:currentFieldType,isNew:true});
+        added++;
+      }
+    });
+
+    setTimeout(()=>{JOBS.forEach(j=>j.isNew=false);applyFilters();},10000);
+    statusEl.className="ai-status success";
+    msgEl.textContent=added>0
+      ? "Found "+jobs.length+" jobs · "+added+" new added · "+new Date().toLocaleDateString()
+      : "Search complete — all "+jobs.length+" jobs already in your list";
+    timeEl.textContent=new Date().toLocaleTimeString();
+    showToast(added>0 ? added+" new jobs added!" : "Already up to date!");
+    applyFilters();
+
+  } catch(err) {
+    console.error("Fetch error:", err);
+    // Clean error message — no manual panel, just a friendly message
     statusEl.className="ai-status error";
-    msgEl.innerHTML="Direct API blocked by browser. <a href='#' onclick='showPastePanel();return false;' style='color:var(--accent)'>Click here to use the 30-second manual method instead ↗</a>";
-    showPastePanel(prompt);
+    msgEl.textContent="Could not fetch jobs right now (" + err.message + "). Try again in a moment.";
+    timeEl.textContent=new Date().toLocaleTimeString();
+    showToast("Fetch failed — try again");
   }
 
   btn.disabled=false;
   btn.innerHTML="⟳ Fetch New Jobs";
-}
-
-// Approach 1: Direct API call (works on HTTPS hosted sites)
-async function tryDirectAPI(prompt){
-  const res=await fetch("https://api.anthropic.com/v1/messages",{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({
-      model:"claude-haiku-4-5-20251001",
-      max_tokens:2500,
-      messages:[{role:"user",content:prompt}]
-    })
-  });
-  if(!res.ok) throw new Error("HTTP "+res.status);
-  const data=await res.json();
-  if(data.error) throw new Error(data.error.message);
-  const text=(data.content||[]).map(b=>b.type==="text"?b.text:"").join("");
-  const jobs=parseJobBlocks(text);
-  if(!jobs.length) throw new Error("No jobs parsed");
-  return jobs;
-}
-
-// Approach 2: Via CORS proxy
-async function tryProxiedAPI(prompt){
-  const body=JSON.stringify({
-    model:"claude-haiku-4-5-20251001",
-    max_tokens:2500,
-    messages:[{role:"user",content:prompt}]
-  });
-  const encoded=encodeURIComponent("https://api.anthropic.com/v1/messages");
-  const res=await fetch("https://api.allorigins.win/post?url="+encoded,{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({data:body})
-  });
-  if(!res.ok) throw new Error("Proxy HTTP "+res.status);
-  const wrapper=await res.json();
-  const data=JSON.parse(wrapper.contents||wrapper.data||"{}");
-  if(data.error) throw new Error(data.error.message);
-  const text=(data.content||[]).map(b=>b.type==="text"?b.text:"").join("");
-  const jobs=parseJobBlocks(text);
-  if(!jobs.length) throw new Error("No jobs parsed from proxy");
-  return jobs;
-}
-
-// ── PASTE PANEL (fallback) ─────────────────────────────────────────────────────
-function showPastePanel(promptText){
-  const panel=document.getElementById("paste-panel");
-  if(promptText) document.getElementById("paste-prompt").value=promptText;
-  panel.style.display="flex";
-}
-
-function closePastePanel(){
-  document.getElementById("paste-panel").style.display="none";
-}
-
-function copyPanelPrompt(){
-  const t=document.getElementById("paste-prompt").value;
-  navigator.clipboard.writeText(t)
-    .then(()=>showToast("Prompt copied! Paste into a new Claude chat"))
-    .catch(()=>showToast("Copy failed — select text manually"));
-}
-
-function importPastedJobs(){
-  const text=document.getElementById("paste-response").value.trim();
-  if(!text){showToast("Paste Claude response first");return;}
-  const jobs=parseJobBlocks(text);
-  if(!jobs.length){
-    showToast("Could not parse — make sure response has JOB_START blocks");
-    return;
-  }
-  let added=0;
-  jobs.forEach(job=>{
-    if(!JOBS.some(j=>j.title===job.title&&j.company===job.company)){
-      JOBS.unshift({...job,id:nextId++,fieldType:currentFieldType,isNew:true});
-      added++;
-    }
-  });
-  setTimeout(()=>{JOBS.forEach(j=>j.isNew=false);applyFilters();},10000);
-  document.getElementById("ai-status").className="ai-status success";
-  document.getElementById("ai-msg").textContent="Imported "+jobs.length+" jobs · "+added+" new";
-  document.getElementById("ai-time").textContent=new Date().toLocaleTimeString();
-  closePastePanel();
-  document.getElementById("paste-response").value="";
-  showToast(added+" new jobs added!");
-  applyFilters();updateStats();
 }
 
 function parseJobBlocks(text){
@@ -956,11 +894,6 @@ applyFilters();
 </div>
 
 
-<!-- PASTE PANEL (fallback when API blocked) -->
-<div id="paste-panel" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:300;align-items:center;justify-content:center;flex-direction:column;">
-  <div style="background:var(--surface);border:1px solid var(--border2);border-radius:14px;padding:24px;width:92%;max-width:580px;max-height:90vh;overflow-y:auto;">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
-      <div style="font-size:14px;font-weight:600;">Fetch Jobs — Quick Method</div>
       <button onclick="closePastePanel()" style="background:var(--surface2);border:1px solid var(--border);color:var(--muted);cursor:pointer;width:28px;height:28px;border-radius:6px;font-size:13px;display:flex;align-items:center;justify-content:center;">✕</button>
     </div>
     <div style="display:flex;flex-direction:column;gap:12px;">
@@ -982,6 +915,46 @@ applyFilters();
         <button onclick="closePastePanel()" style="padding:10px 16px;border-radius:7px;background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:12px;cursor:pointer;font-family:var(--font);">Cancel</button>
       </div>
     </div>
+  </div>
+</div>
+
+
+<!-- SETTINGS PANEL -->
+<div class="settings-panel" id="settings-panel" style="display:none;position:fixed;top:62px;right:24px;z-index:150;width:360px;background:var(--surface);border:1px solid var(--border2);border-radius:14px;padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.5);">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+    <div style="font-size:13px;font-weight:600;color:var(--text);">Search Settings</div>
+    <button onclick="toggleSettings()" style="background:var(--surface2);border:1px solid var(--border);color:var(--muted);cursor:pointer;width:26px;height:26px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:13px;">x</button>
+  </div>
+  <div style="margin-bottom:14px;">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;color:var(--faint);margin-bottom:8px;">Job Roles (one per line)</div>
+    <textarea id="roles-input" rows="6" style="width:100%;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;color:var(--text);font-size:12px;font-family:var(--mono);padding:10px;outline:none;resize:vertical;line-height:1.7;"></textarea>
+  </div>
+  <div style="margin-bottom:14px;">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;color:var(--faint);margin-bottom:8px;">Location</div>
+    <input id="location-input" type="text" placeholder="e.g. Germany" style="width:100%;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;color:var(--text);font-size:12px;font-family:var(--mono);padding:8px 10px;outline:none;"/>
+  </div>
+  <div style="margin-bottom:16px;">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;color:var(--faint);margin-bottom:8px;">My Degree (for qual. matching)</div>
+    <select id="degree-input" style="width:100%;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;color:var(--text);font-size:12px;font-family:var(--mono);padding:8px 10px;outline:none;cursor:pointer;">
+      <option value="cs">Computer Science / IT / Software Engineering</option>
+      <option value="mech">Mechanical Engineering</option>
+      <option value="both">Both (ME + CS)</option>
+    </select>
+  </div>
+  <div style="border-top:1px solid var(--border);padding-top:12px;margin-bottom:14px;">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;color:var(--faint);margin-bottom:8px;">Quick Presets</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;">
+      <button onclick="applyPreset('sap')" class="preset-btn">SAP / ABAP</button>
+      <button onclick="applyPreset('fullstack')" class="preset-btn">Full-Stack</button>
+      <button onclick="applyPreset('data')" class="preset-btn">Data / ML</button>
+      <button onclick="applyPreset('cloud')" class="preset-btn">Cloud / DevOps</button>
+      <button onclick="applyPreset('cad')" class="preset-btn">CAD / Design</button>
+      <button onclick="applyPreset('auto')" class="preset-btn">Automotive</button>
+    </div>
+  </div>
+  <div style="display:flex;gap:8px;">
+    <button onclick="saveSettings()" style="flex:1;padding:9px;border-radius:7px;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;color:#fff;font-size:12px;font-weight:600;cursor:pointer;font-family:var(--font);">Save and Fetch Now</button>
+    <button onclick="resetSettings()" style="padding:9px 14px;border-radius:7px;background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:12px;cursor:pointer;font-family:var(--font);">Reset</button>
   </div>
 </div>
 
